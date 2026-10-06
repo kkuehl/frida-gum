@@ -31,6 +31,8 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
 #ifdef HAVE_WINDOWS
 # define VC_EXTRALEAN
 # include <windows.h>
@@ -3125,6 +3127,24 @@ gum_exec_ctx_maybe_emit_compile_event (GumExecCtx * ctx,
   }
 }
 
+static void
+gum_stalker_dbg (const char * format, ...)
+{
+  FILE * f;
+  va_list args;
+
+  f = fopen ("C:\\temp\\gum-stalker-debug.log", "a");
+  if (f == NULL)
+    return;
+
+  va_start (args, format);
+  vfprintf (f, format, args);
+  va_end (args);
+
+  fflush (f);
+  fclose (f);
+}
+
 gboolean
 gum_stalker_iterator_next (GumStalkerIterator * self,
                            const cs_insn ** insn)
@@ -3151,6 +3171,7 @@ gum_stalker_iterator_next (GumStalkerIterator * self,
     if (gum_stalker_iterator_is_out_of_space (self))
     {
       gc->continuation_real_address = instruction->end;
+      gum_stalker_dbg ("NEXT out_of_space addr=%p\n", (gpointer) instruction->end);
       gum_generator_context_release_user_data_reg (self->exec_block, gc,
           gc->code_writer);
       return FALSE;
@@ -3158,6 +3179,7 @@ gum_stalker_iterator_next (GumStalkerIterator * self,
 
     if (!skip_implicitly_requested && gum_x86_relocator_eob (rl))
     {
+      gum_stalker_dbg ("NEXT eob addr=%p\n", (gpointer) instruction->end);
       gum_generator_context_release_user_data_reg (self->exec_block, gc,
           gc->code_writer);
       return FALSE;
@@ -3169,6 +3191,10 @@ gum_stalker_iterator_next (GumStalkerIterator * self,
   n_read = gum_x86_relocator_read_one (rl, &instruction->ci);
   if (n_read == 0)
   {
+    gum_stalker_dbg ("NEXT read_one=0 prev_end=%p eob=%d eoi=%d\n",
+        (gpointer) (self->generator_context->instruction != NULL
+            ? self->generator_context->instruction->end : NULL),
+        gum_x86_relocator_eob (rl), gum_x86_relocator_eoi (rl));
     gum_generator_context_release_user_data_reg (self->exec_block, gc,
         gc->code_writer);
     return FALSE;
