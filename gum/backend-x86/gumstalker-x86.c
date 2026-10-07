@@ -32,7 +32,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <stdarg.h>
 #ifdef HAVE_WINDOWS
 # define VC_EXTRALEAN
 # include <windows.h>
@@ -930,10 +929,32 @@ gum_stalker_unwind_translator_iface_init (gpointer iface,
   pc_iface->install_resume_context = gum_stalker_install_unwind_resume_context;
 }
 
+static FILE * gum_stalker_dbg_file = NULL;
+
+static void
+gum_stalker_dbg_init (void)
+{
+#ifdef HAVE_WINDOWS
+  gum_stalker_dbg_file = fopen ("C:\\temp\\gum-stalker-debug.log", "a");
+#endif
+}
+
+void
+gum_stalker_dbg_str (const char * msg)
+{
+  if (gum_stalker_dbg_file != NULL)
+  {
+    fwrite (msg, 1, strlen (msg), gum_stalker_dbg_file);
+    fflush (gum_stalker_dbg_file);
+  }
+}
+
 static void
 gum_stalker_init (GumStalker * self)
 {
   gsize page_size;
+
+  gum_stalker_dbg_init ();
 
   self->exclusions = g_array_new (FALSE, FALSE, sizeof (GumMemoryRange));
   self->trust_threshold = 1;
@@ -3085,6 +3106,16 @@ gum_exec_ctx_compile_block (GumExecCtx * ctx,
   ctx->transform_block_impl (ctx->transformer, &iterator, &output);
   ctx->pending_calls--;
 
+  {
+    char buf[160];
+    g_snprintf (buf, sizeof (buf),
+        "PREFLUSH start=%p size=%llu cont=%p\n",
+        (gpointer) block->real_start,
+        (unsigned long long) (rl->input_cur - rl->input_start),
+        (gpointer) gc.continuation_real_address);
+    gum_stalker_dbg_str (buf);
+  }
+
   if (gc.continuation_real_address != NULL)
   {
     GumBranchTarget continue_target = { 0, };
@@ -3099,6 +3130,12 @@ gum_exec_ctx_compile_block (GumExecCtx * ctx,
   gum_x86_writer_put_breakpoint (cw); /* Should never get here */
 
   all_labels_resolved = gum_x86_writer_flush (cw);
+  {
+    char buf[128];
+    g_snprintf (buf, sizeof (buf), "FLUSH1 start=%p ok=%d\n",
+        (gpointer) block->real_start, all_labels_resolved);
+    gum_stalker_dbg_str (buf);
+  }
   if (!all_labels_resolved)
     gum_panic ("Failed to resolve labels");
 
@@ -3109,6 +3146,13 @@ gum_exec_ctx_compile_block (GumExecCtx * ctx,
   *input_size = rl->input_cur - rl->input_start;
   *output_size = gum_x86_writer_offset (cw);
   *slow_size = gum_x86_writer_offset (cws);
+
+  {
+    char buf[128];
+    g_snprintf (buf, sizeof (buf), "BLOCK start=%p size=%llu\n",
+        (gpointer) block->real_start, (unsigned long long) *input_size);
+    gum_stalker_dbg_str (buf);
+  }
 }
 
 static void
@@ -3125,24 +3169,6 @@ gum_exec_ctx_maybe_emit_compile_event (GumExecCtx * ctx,
 
     ctx->sink_process_impl (ctx->sink, &ev, NULL);
   }
-}
-
-static void
-gum_stalker_dbg (const char * format, ...)
-{
-  FILE * f;
-  va_list args;
-
-  f = fopen ("C:\\temp\\gum-stalker-debug.log", "a");
-  if (f == NULL)
-    return;
-
-  va_start (args, format);
-  vfprintf (f, format, args);
-  va_end (args);
-
-  fflush (f);
-  fclose (f);
 }
 
 gboolean
@@ -3171,7 +3197,7 @@ gum_stalker_iterator_next (GumStalkerIterator * self,
     if (gum_stalker_iterator_is_out_of_space (self))
     {
       gc->continuation_real_address = instruction->end;
-      gum_stalker_dbg ("NEXT out_of_space addr=%p\n", (gpointer) instruction->end);
+      gum_stalker_dbg_str ("REASON out_of_space\n");
       gum_generator_context_release_user_data_reg (self->exec_block, gc,
           gc->code_writer);
       return FALSE;
@@ -3179,7 +3205,11 @@ gum_stalker_iterator_next (GumStalkerIterator * self,
 
     if (!skip_implicitly_requested && gum_x86_relocator_eob (rl))
     {
-      gum_stalker_dbg ("NEXT eob addr=%p\n", (gpointer) instruction->end);
+      char buf[96];
+      g_snprintf (buf, sizeof (buf), "REASON eob block=%p end=%p\n",
+          (gpointer) self->exec_block->real_start,
+          (gpointer) instruction->end);
+      gum_stalker_dbg_str (buf);
       gum_generator_context_release_user_data_reg (self->exec_block, gc,
           gc->code_writer);
       return FALSE;
@@ -3191,10 +3221,12 @@ gum_stalker_iterator_next (GumStalkerIterator * self,
   n_read = gum_x86_relocator_read_one (rl, &instruction->ci);
   if (n_read == 0)
   {
-    gum_stalker_dbg ("NEXT read_one=0 prev_end=%p eob=%d eoi=%d\n",
+    char buf[96];
+    g_snprintf (buf, sizeof (buf), "REASON read_one=0 block=%p end=%p\n",
+        (gpointer) self->exec_block->real_start,
         (gpointer) (self->generator_context->instruction != NULL
-            ? self->generator_context->instruction->end : NULL),
-        gum_x86_relocator_eob (rl), gum_x86_relocator_eoi (rl));
+            ? self->generator_context->instruction->end : NULL));
+    gum_stalker_dbg_str (buf);
     gum_generator_context_release_user_data_reg (self->exec_block, gc,
         gc->code_writer);
     return FALSE;
@@ -3229,7 +3261,7 @@ gum_stalker_iterator_is_out_of_space (GumStalkerIterator * self)
 {
   GumExecBlock * block = self->exec_block;
   GumSlab * slab = &block->code_slab->slab;
-  gsize capacity, snapshot_size;
+  gsize capacity, snapshot_size, needed;
 
   capacity = (guint8 *) gum_slab_end (slab) -
       (guint8 *) gum_x86_writer_cur (self->generator_context->code_writer);
@@ -3238,8 +3270,21 @@ gum_stalker_iterator_is_out_of_space (GumStalkerIterator * self)
       self->exec_context->stalker,
       self->generator_context->instruction->end - block->real_start);
 
-  return capacity < GUM_EXEC_BLOCK_MIN_CAPACITY + snapshot_size +
+  needed = GUM_EXEC_BLOCK_MIN_CAPACITY + snapshot_size +
       gum_stalker_get_ic_entry_size (self->exec_context->stalker);
+
+  if (capacity < needed)
+  {
+    char buf[160];
+    g_snprintf (buf, sizeof (buf),
+        "REASON out_of_space cap=%llu need=%llu block=%p\n",
+        (unsigned long long) capacity, (unsigned long long) needed,
+        (gpointer) block->real_start);
+    gum_stalker_dbg_str (buf);
+    return TRUE;
+  }
+
+  return FALSE;
 }
 
 void
@@ -3312,7 +3357,24 @@ gum_stalker_iterator_keep (GumStalkerIterator * self)
       break;
   }
 
+  {
+    char dbuf[160];
+    g_snprintf (dbuf, sizeof (dbuf), "KEEP-A id=%u mne=%s bytes=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+        insn->id, insn->mnemonic,
+        insn->size > 0 ? insn->bytes[0] : 0, insn->size > 1 ? insn->bytes[1] : 0,
+        insn->size > 2 ? insn->bytes[2] : 0, insn->size > 3 ? insn->bytes[3] : 0,
+        insn->size > 4 ? insn->bytes[4] : 0, insn->size > 5 ? insn->bytes[5] : 0,
+        insn->size > 6 ? insn->bytes[6] : 0, insn->size > 7 ? insn->bytes[7] : 0);
+    gum_stalker_dbg_str (dbuf);
+  }
+
   gum_exec_block_close_prolog (block, gc, gc->code_writer);
+
+  {
+    char dbuf[128];
+    g_snprintf (dbuf, sizeof (dbuf), "KEEP-B id=%u\n", insn->id);
+    gum_stalker_dbg_str (dbuf);
+  }
 
   if ((requirements & GUM_REQUIRE_RELOCATION) != 0)
   {
@@ -3325,6 +3387,12 @@ gum_stalker_iterator_keep (GumStalkerIterator * self)
   }
 
   self->requirements = requirements;
+
+  {
+    char dbuf[128];
+    g_snprintf (dbuf, sizeof (dbuf), "KEEP-C id=%u done\n", insn->id);
+    gum_stalker_dbg_str (dbuf);
+  }
 }
 
 GumMemoryAccess

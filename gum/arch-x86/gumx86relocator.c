@@ -11,6 +11,9 @@
 #include "gumx86reader.h"
 
 #include <string.h>
+#include <glib.h>
+
+extern void gum_stalker_dbg_str (const char * msg);
 
 #define GUM_MAX_INPUT_INSN_COUNT (100)
 
@@ -191,7 +194,17 @@ gum_x86_relocator_read_one (GumX86Relocator * self,
   insn = *insn_ptr;
 
   if (!cs_disasm_iter (self->capstone, &code, &size, &address, insn))
-    return 0;
+    {
+      char buf[160];
+      g_snprintf (buf, sizeof (buf),
+          "RELOC read_one=0 eoi=%d pc=%p bytes=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+          self->eoi, (gpointer) self->input_cur,
+          self->input_cur[0], self->input_cur[1], self->input_cur[2],
+          self->input_cur[3], self->input_cur[4], self->input_cur[5],
+          self->input_cur[6], self->input_cur[7]);
+      gum_stalker_dbg_str (buf);
+      return 0;
+    }
 
   switch (insn->id)
   {
